@@ -1,0 +1,736 @@
+openapi: 3.1.0
+info:
+  title: Fraud Detection Platform API
+  version: 1.0.0
+  description: |
+    API of the suspicious banking-operations detection system.
+
+    Four surfaces share the `/api/v1` prefix:
+
+    1. **External (bank / simulator)** - HMAC-signed requests. Rate limited per API client.
+    2. **Staff** - Laravel Sanctum bearer tokens (analysts, supervisors, admins).
+    3. **Models** - read-only model comparison (`models.view` permission).
+    4. **ML ingest** - service token used by the external Python training scripts.
+
+    ### HMAC authentication (external API)
+
+    Every external request carries:
+
+    | Header | Meaning |
+    |---|---|
+    | `X-Api-Key` | Public key id of the API client |
+    | `X-Timestamp` | Unix time in seconds; must be within the tolerance window (default 300 s) |
+    | `X-Signature` | `hex(hmac_sha256(secret, timestamp + "." + rawBody))` |
+    | `Idempotency-Key` | Optional. Retries with the same key never create duplicates |
+
+    Example (shell):
+
+    ```sh
+    TS=$(date +%s)
+    BODY='{"event_type":"login","account_number":"1001"}'
+    SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^.* //')
+    curl -X POST https://host/api/v1/events -H "X-Api-Key: $KEY" -H "X-Timestamp: $TS" \
+         -H "X-Signature: $SIG" -H "Content-Type: application/json" -d "$BODY"
+    ```
+
+    The signature is computed over the **exact raw body** that is sent.
+servers:
+  - url: http://localhost:8000/api/v1
+    description: Local development
+  - url: http://localhost:8080/api/v1
+    description: Docker Compose (nginx)
+tags:
+  - name: External
+    description: Bank / simulator integration (HMAC)
+  - name: Staff
+    description: Alert workspace (Sanctum)
+  - name: Models
+    description: Model registry comparison
+  - name: ML
+    description: Training-script ingest
+
+paths:
+  /events:
+    post:
+      tags: [External]
+      operationId: ingestEvent
+      summary: Ingest a banking event asynchronously
+      description: |
+        Validates and queues the event for scoring (transfer, login, add_beneficiary, change_phone, raise_limit, open_account).
+        Returns immediately with `202`. The `Idempotency-Key` header (or `idempotency_key` field) makes retries safe.
+      security: [{ hmac: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EventPayload' }
+            examples:
+              transfer:
+                value:
+                  event_type: transfer
+                  account_number: "1001"
+                  amount: 25000
+                  beneficiary_account: "9002"
+                  beneficiary_name: Sami
+                  device_fingerprint: dev-abc-123
+                  ip_address: 203.0.113.9
+                  city: Amman
+                  channel: mobile
+      responses:
+        '202':
+          description: Accepted for asynchronous processing
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, idempotency_key]
+                properties:
+                  status: { type: string, enum: [accepted] }
+                  idempotency_key: { type: string }
+              example: { status: accepted, idempotency_key: evt_6f1c2c0e-2e0d-4f55-9d0b-3a6a3a7d1f10 }
+        '401': { $ref: '#/components/responses/HmacError' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /score:
+    post:
+      tags: [External]
+      operationId: scoreEvent
+      summary: Score an event synchronously
+      description: |
+        Same payload as `POST /events`, but returns the decision in the response (target latency below 300 ms).
+        `allow` lets the operation proceed, `challenge` returns an `otp_challenge_id` to be verified via `POST /otp/verify`, `block` stops it.
+      security: [{ hmac: [] }]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EventPayload' }
+      responses:
+        '200':
+          description: Scoring result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScoreResult' }
+              example:
+                subject_type: transaction
+                subject_id: 4812
+                risk_score_id: 9120
+                score: 82
+                decision: block
+                reasons:
+                  - "Amount is 12.5x the account average"
+                  - "New device"
+                otp_challenge_id: null
+                latency_ms: 41
+        '401': { $ref: '#/components/responses/HmacError' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /otp/verify:
+    post:
+      tags: [External]
+      operationId: verifyOtp
+      summary: Verify an OTP challenge
+      security: [{ hmac: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [otp_challenge_id, code]
+              properties:
+                otp_challenge_id: { type: integer, example: 77 }
+                code: { type: string, pattern: '^[0-9]{6}$', example: "493021" }
+      responses:
+        '200':
+          description: Verification outcome
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  verified: { type: boolean }
+                  status: { type: string, enum: [pending, verified, failed, expired] }
+                  remaining_attempts: { type: integer }
+                  transaction_status:
+                    type: [string, 'null']
+                    enum: [pending, completed, held, blocked, rejected, null]
+              example: { verified: true, status: verified, remaining_attempts: 3, transaction_status: completed }
+        '401': { $ref: '#/components/responses/HmacError' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /verification-results:
+    post:
+      tags: [External]
+      operationId: reportVerificationResult
+      summary: Report the final outcome of an operation (becomes a training label)
+      description: |
+        - `type=transaction|event`: `outcome` is `fraud` or `legitimate`.
+        - `type=otp`: `outcome` is `verified` (legitimate) or `failed` (fraud).
+        `source` defaults to `bank` (or `customer` for OTP results).
+      security: [{ hmac: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, reference_id, outcome]
+              properties:
+                type: { type: string, enum: [transaction, event, otp] }
+                reference_id: { type: integer, minimum: 1 }
+                outcome: { type: string, enum: [fraud, legitimate, verified, failed] }
+                source: { type: string, enum: [bank, customer] }
+                note: { type: string, maxLength: 500 }
+            example: { type: transaction, reference_id: 4812, outcome: fraud, source: bank }
+      responses:
+        '201':
+          description: Label recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  label_id: { type: integer }
+                  is_fraud: { type: boolean }
+                  source: { type: string, enum: [analyst, customer, investigation, bank] }
+              example: { label_id: 310, is_fraud: true, source: bank }
+        '401': { $ref: '#/components/responses/HmacError' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /sync:
+    post:
+      tags: [External]
+      operationId: syncReferenceData
+      summary: Idempotent batch upsert of customers, accounts and devices
+      description: Customers are matched by email (else phone), accounts by `account_number`, devices by `device_fingerprint`.
+      security: [{ hmac: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customers]
+              properties:
+                customers:
+                  type: array
+                  minItems: 1
+                  maxItems: 500
+                  items: { $ref: '#/components/schemas/SyncCustomer' }
+            example:
+              customers:
+                - name: Ahmad Khalil
+                  email: ahmad@example.com
+                  phone: "+962790000000"
+                  avg_balance: 2500
+                  accounts:
+                    - { account_number: "1001", type: checking, status: active, balance: 3100, transfer_limit: 20000 }
+                  devices:
+                    - { device_fingerprint: dev-abc-123, device_type: android, is_trusted: true }
+      responses:
+        '200':
+          description: Counts of processed rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [synced] }
+                  customers: { type: integer }
+                  accounts: { type: integer }
+                  devices: { type: integer }
+              example: { status: synced, customers: 1, accounts: 1, devices: 1 }
+        '401': { $ref: '#/components/responses/HmacError' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /alerts:
+    get:
+      tags: [Staff]
+      operationId: listAlerts
+      summary: List alerts (queue)
+      description: Requires the `alerts.view` permission. Results are paginated (Laravel paginator envelope).
+      security: [{ sanctum: [] }]
+      parameters:
+        - { name: status, in: query, schema: { $ref: '#/components/schemas/AlertStatus' } }
+        - { name: priority, in: query, schema: { $ref: '#/components/schemas/Priority' } }
+        - { name: min_score, in: query, schema: { type: integer, minimum: 0, maximum: 100 } }
+        - { name: max_score, in: query, schema: { type: integer, minimum: 0, maximum: 100 } }
+        - { name: channel, in: query, schema: { type: string, maxLength: 50 } }
+        - { name: date_from, in: query, schema: { type: string, format: date } }
+        - { name: date_to, in: query, schema: { type: string, format: date } }
+        - { name: min_amount, in: query, schema: { type: number, minimum: 0 } }
+        - { name: max_amount, in: query, schema: { type: number, minimum: 0 } }
+        - { name: mine, in: query, description: Only alerts assigned to the caller, schema: { type: boolean } }
+        - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: page, in: query, schema: { type: integer, minimum: 1 } }
+      responses:
+        '200':
+          description: A page of alerts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Alert' }
+                  links: { type: object, additionalProperties: true }
+                  meta: { type: object, additionalProperties: true }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /alerts/{alert}:
+    get:
+      tags: [Staff]
+      operationId: getAlert
+      summary: Alert details with reasons and features
+      security: [{ sanctum: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AlertId'
+      responses:
+        '200':
+          description: The alert
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/AlertDetail' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /alerts/{alert}/decision:
+    post:
+      tags: [Staff]
+      operationId: decideAlert
+      summary: Record the analyst decision
+      description: Requires `alerts.decide`. Closes or escalates the alert, writes a training label and the audit trail.
+      security: [{ sanctum: [] }]
+      parameters:
+        - $ref: '#/components/parameters/AlertId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision, reason]
+              properties:
+                decision: { $ref: '#/components/schemas/AnalystDecision' }
+                reason: { type: string, minLength: 3, maxLength: 2000 }
+            example: { decision: confirmed_fraud, reason: "Customer confirmed by phone they did not make this transfer." }
+      responses:
+        '200':
+          description: The updated alert
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { $ref: '#/components/schemas/AlertDetail' }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /accounts/{account}/network:
+    get:
+      tags: [Staff]
+      operationId: getAccountNetwork
+      summary: Relationship graph around an account (shared devices, beneficiaries)
+      security: [{ sanctum: [] }]
+      parameters:
+        - { name: account, in: path, required: true, schema: { type: integer } }
+        - { name: depth, in: query, schema: { type: integer, minimum: 1, maximum: 3, default: 2 } }
+      responses:
+        '200':
+          description: Graph nodes and edges
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      nodes:
+                        type: array
+                        items: { type: object, additionalProperties: true }
+                      edges:
+                        type: array
+                        items: { type: object, additionalProperties: true }
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /models/compare:
+    get:
+      tags: [Models]
+      operationId: compareModels
+      summary: Compare registered models by their latest run
+      description: |
+        Requires `models.view` (admin, supervisor). `final_score` is a 0-100 weighted score over the present metrics:
+        PR-AUC 30, Recall@Precision90 20, Precision@K 15, Interpretability 10, p95 latency 10 (vs a 300 ms budget),
+        Stability 10, Resource cost 5. F1, F2 and ROC-AUC are shown but not weighted.
+      security: [{ sanctum: [] }]
+      responses:
+        '200':
+          description: Models with normalised metrics and the weights used
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ModelComparisonItem' }
+                  weights:
+                    type: object
+                    additionalProperties: { type: integer }
+                    example:
+                      pr_auc: 30
+                      recall_at_p90: 20
+                      precision_at_k: 15
+                      interpretability: 10
+                      p95_latency_ms: 10
+                      stability: 10
+                      resource_score: 5
+        '401': { $ref: '#/components/responses/Unauthenticated' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /ml/model-runs:
+    post:
+      tags: [ML]
+      operationId: ingestModelRun
+      summary: Register a model version and its metrics (called by training scripts)
+      description: |
+        Authenticated with the static service token (`ML_INGEST_TOKEN`) as a Bearer token. New models start as `candidate`;
+        promotion to champion is a manual, audited admin action. When `metrics.drift_detected` is true, all active admins are notified.
+      security: [{ mlToken: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ModelRunPayload' }
+            example:
+              model_name: xgboost-fraud
+              algorithm: XGBoost
+              version_number: v2026.10.1
+              trained_at: "2026-10-30T22:15:00Z"
+              metrics:
+                pr_auc: 0.81
+                recall_at_p90: 0.64
+                precision_at_k: 0.88
+                f1: 0.72
+                f2: 0.69
+                roc_auc: 0.97
+                interpretability: 0.7
+                p95_latency_ms: 38
+                pr_auc_std: 0.012
+                resource_score: 0.8
+                drift_detected: false
+      responses:
+        '201':
+          description: Run registered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ModelRun' }
+        '401':
+          description: Missing/invalid token, or token not configured on the server
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CodedError' }
+              example: { message: Invalid service token., code: invalid_token }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+components:
+  securitySchemes:
+    hmac:
+      type: apiKey
+      in: header
+      name: X-Signature
+      description: |
+        HMAC-SHA256 request signing. Also send `X-Api-Key` and `X-Timestamp`.
+        `X-Signature = hex(hmac_sha256(secret, X-Timestamp + "." + rawBody))`.
+    sanctum:
+      type: http
+      scheme: bearer
+      description: Laravel Sanctum personal access token.
+    mlToken:
+      type: http
+      scheme: bearer
+      description: Static ML ingest token (`ML_INGEST_TOKEN`).
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Unique key per logical operation; replaying it returns the original result without duplicates.
+      schema: { type: string, maxLength: 100 }
+    AlertId:
+      name: alert
+      in: path
+      required: true
+      schema: { type: integer }
+
+  responses:
+    HmacError:
+      description: HMAC authentication failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/CodedError' }
+          examples:
+            missing_headers:
+              value: { message: "X-Api-Key, X-Timestamp and X-Signature headers are required.", code: missing_headers }
+            timestamp_out_of_range:
+              value: { message: Request timestamp is outside the allowed window., code: timestamp_out_of_range }
+            invalid_client:
+              value: { message: "Unknown, inactive or revoked API client.", code: invalid_client }
+            invalid_signature:
+              value: { message: Signature mismatch., code: invalid_signature }
+    ValidationError:
+      description: Validation failed
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message: { type: string }
+              errors:
+                type: object
+                additionalProperties:
+                  type: array
+                  items: { type: string }
+          example:
+            message: The amount field is required.
+            errors: { amount: [The amount field is required.] }
+    RateLimited:
+      description: Too many requests (per API client)
+      headers:
+        Retry-After: { schema: { type: integer } }
+    Unauthenticated:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema: { type: object, properties: { message: { type: string } } }
+          example: { message: Unauthenticated. }
+    Forbidden:
+      description: The user lacks the required permission
+      content:
+        application/json:
+          schema: { type: object, properties: { message: { type: string } } }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { type: object, properties: { message: { type: string } } }
+
+  schemas:
+    CodedError:
+      type: object
+      required: [message, code]
+      properties:
+        message: { type: string }
+        code:
+          type: string
+          enum: [missing_headers, timestamp_out_of_range, invalid_client, invalid_signature, invalid_token]
+    Decision:
+      type: string
+      enum: [allow, challenge, block]
+    Priority:
+      type: string
+      enum: [low, medium, high, critical]
+    AlertStatus:
+      type: string
+      enum: [open, in_review, escalated, pending_info, closed]
+    AnalystDecision:
+      type: string
+      enum: [confirmed_fraud, false_positive, escalated, info_requested]
+    EventPayload:
+      type: object
+      required: [event_type, account_number]
+      description: '`amount` is required for `transfer`; `beneficiary_account` is required for `transfer` and `add_beneficiary`. `account_number` must exist except for `open_account`.'
+      properties:
+        event_type: { type: string, enum: [login, transfer, add_beneficiary, change_phone, raise_limit, open_account] }
+        account_number: { type: string, maxLength: 64 }
+        event_time: { type: string, format: date-time }
+        idempotency_key: { type: string, maxLength: 100 }
+        device_fingerprint: { type: string, maxLength: 255 }
+        device_type: { type: string, maxLength: 50 }
+        ip_address: { type: string, format: ip }
+        city: { type: string, maxLength: 100 }
+        channel: { type: string, maxLength: 30 }
+        amount: { type: number, exclusiveMinimum: 0 }
+        beneficiary_account: { type: string, maxLength: 64 }
+        beneficiary_name: { type: string, maxLength: 150 }
+        bank_name: { type: string, maxLength: 150 }
+        new_phone: { type: string, maxLength: 30 }
+        new_limit: { type: number, minimum: 0 }
+        customer_id: { type: integer }
+        customer_email: { type: string, format: email }
+        details: { type: object, additionalProperties: true }
+    ScoreResult:
+      type: object
+      properties:
+        subject_type: { type: string, enum: [transaction, event] }
+        subject_id: { type: integer }
+        risk_score_id: { type: integer }
+        score: { type: integer, minimum: 0, maximum: 100 }
+        decision: { $ref: '#/components/schemas/Decision' }
+        reasons:
+          type: array
+          items: { type: string }
+        otp_challenge_id: { type: [integer, 'null'] }
+        latency_ms: { type: [integer, 'null'] }
+    SyncCustomer:
+      type: object
+      required: [name]
+      description: Either `email` or `phone` is required.
+      properties:
+        name: { type: string, maxLength: 150 }
+        email: { type: [string, 'null'], format: email }
+        phone: { type: [string, 'null'], maxLength: 30 }
+        avg_balance: { type: number, minimum: 0 }
+        usage_pattern: { type: object, additionalProperties: true }
+        accounts:
+          type: array
+          maxItems: 50
+          items:
+            type: object
+            required: [account_number]
+            properties:
+              account_number: { type: string, maxLength: 64 }
+              type: { type: string, maxLength: 30 }
+              status: { type: string, enum: [active, frozen, closed] }
+              balance: { type: number }
+              transfer_limit: { type: number, minimum: 0 }
+        devices:
+          type: array
+          maxItems: 50
+          items:
+            type: object
+            required: [device_fingerprint]
+            properties:
+              device_fingerprint: { type: string, maxLength: 255 }
+              device_type: { type: string, maxLength: 50 }
+              is_trusted: { type: boolean }
+    Alert:
+      type: object
+      properties:
+        id: { type: integer }
+        status: { $ref: '#/components/schemas/AlertStatus' }
+        priority: { $ref: '#/components/schemas/Priority' }
+        score: { type: [integer, 'null'] }
+        system_decision: { oneOf: [{ $ref: '#/components/schemas/Decision' }, { type: 'null' }] }
+        analyst_decision: { oneOf: [{ $ref: '#/components/schemas/AnalystDecision' }, { type: 'null' }] }
+        decision_reason: { type: [string, 'null'] }
+        decided_by: { type: [integer, 'null'] }
+        decided_at: { type: [string, 'null'], format: date-time }
+        assigned_to: { type: [integer, 'null'] }
+        case_id: { type: [integer, 'null'] }
+        account:
+          type: [object, 'null']
+          properties:
+            id: { type: integer }
+            account_number: { type: string }
+            status: { type: string, enum: [active, frozen, closed] }
+        transaction:
+          type: [object, 'null']
+          properties:
+            id: { type: integer }
+            amount: { type: number }
+            channel: { type: [string, 'null'] }
+            status: { type: string, enum: [pending, completed, held, blocked, rejected] }
+            time: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+    AlertDetail:
+      allOf:
+        - $ref: '#/components/schemas/Alert'
+        - type: object
+          properties:
+            reasons:
+              type: array
+              items: { type: object, additionalProperties: true }
+            features:
+              type: object
+              additionalProperties: true
+    ModelComparisonItem:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        algorithm: { type: [string, 'null'] }
+        status: { type: string, enum: [champion, shadow, candidate, archived] }
+        latest_run:
+          type: [object, 'null']
+          properties:
+            id: { type: integer }
+            version: { type: string }
+            trained_at: { type: [string, 'null'], format: date-time }
+            metrics: { $ref: '#/components/schemas/CanonicalMetrics' }
+            final_score: { type: [number, 'null'], minimum: 0, maximum: 100 }
+    CanonicalMetrics:
+      type: object
+      description: Canonical metrics; `null` when the run did not report them.
+      properties:
+        pr_auc: { type: [number, 'null'] }
+        recall_at_p90: { type: [number, 'null'] }
+        precision_at_k: { type: [number, 'null'] }
+        interpretability: { type: [number, 'null'] }
+        p95_latency_ms: { type: [number, 'null'], description: "Models above 300 ms are flagged 'excluded from real-time path'." }
+        stability: { type: [number, 'null'] }
+        resource_score: { type: [number, 'null'] }
+        f1: { type: [number, 'null'] }
+        f2: { type: [number, 'null'] }
+        roc_auc: { type: [number, 'null'] }
+    ModelRunPayload:
+      type: object
+      required: [model_name, version_number, metrics]
+      properties:
+        model_name: { type: string, maxLength: 150 }
+        algorithm: { type: string, maxLength: 100 }
+        version_number: { type: string, maxLength: 50 }
+        trained_at: { type: string, format: date-time }
+        metrics:
+          type: object
+          description: Unknown keys are stored as-is. Aliases accepted - `auc`, `recall`, `precision`, `latency_p95_ms`, `p95_latency`, `resource_cost`.
+          properties:
+            pr_auc: { type: number, minimum: 0, maximum: 1 }
+            recall_at_p90: { type: number, minimum: 0, maximum: 1 }
+            precision_at_k: { type: number, minimum: 0, maximum: 1 }
+            interpretability: { type: number, minimum: 0, maximum: 1 }
+            p95_latency_ms: { type: number, minimum: 0 }
+            stability: { type: number, minimum: 0, maximum: 1 }
+            pr_auc_std: { type: number, minimum: 0, description: "Std of PR-AUC across seeds; stability = 1 - pr_auc_std when `stability` is absent." }
+            resource_score: { type: number, minimum: 0, maximum: 1 }
+            f1: { type: number }
+            f2: { type: number }
+            roc_auc: { type: number }
+            drift_detected: { type: boolean, description: When true, admins are notified. }
+          additionalProperties: true
+    ModelRun:
+      type: object
+      properties:
+        id: { type: integer }
+        model_id: { type: integer }
+        model_name: { type: string }
+        model_status: { type: string, enum: [champion, shadow, candidate, archived] }
+        version_number: { type: string }
+        metrics: { type: object, additionalProperties: true }
+        trained_at: { type: [string, 'null'], format: date-time }
+        drift_detected: { type: boolean }

@@ -1,0 +1,192 @@
+# Dev & demo stack.   cp .env.docker.example .env && docker compose up -d --build
+#   App:      http://localhost:${WEB_PORT:-8080}       API docs: /docs/api
+#   Mailpit:  http://localhost:8025                    MySQL: localhost:3306
+# Vite dev server instead of the built bundle:  docker compose --profile dev up -d vite
+x-php: &php
+  build:
+    context: .
+    dockerfile: docker/php/Dockerfile
+  image: bank-app-php:dev
+  restart: unless-stopped
+  working_dir: /var/www/html
+  volumes:
+    - .:/var/www/html
+    - vendor:/var/www/html/vendor
+  environment: &php-env
+    DB_HOST: ${DB_HOST:-mysql}
+    DB_PORT: ${DB_PORT:-3306}
+    DB_DATABASE: ${DB_DATABASE:-bank_db}
+    DB_USERNAME: ${DB_USERNAME:-bank}
+    DB_PASSWORD: ${DB_PASSWORD:-bank_secret}
+    REDIS_HOST: ${REDIS_HOST:-redis}
+    MAIL_HOST: ${MAIL_HOST:-mailpit}
+    MAIL_PORT: ${MAIL_PORT:-1025}
+
+services:
+  app:
+    <<: *php
+    container_name: bank-app
+    environment:
+      <<: *php-env
+      RUN_MIGRATIONS: "true"
+      SEED: ${SEED:-false}
+    depends_on:
+      mysql: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/ready && php-fpm -t >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: bank-nginx
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    volumes:
+      - .:/var/www/html:ro
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      app: { condition: service_healthy }
+      assets: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  queue:
+    <<: *php
+    container_name: bank-queue
+    command: php artisan queue:work --tries=3 --sleep=1 --max-time=3600
+    depends_on:
+      app: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'artisan queue:work' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  scheduler:
+    <<: *php
+    container_name: bank-scheduler
+    command: php artisan schedule:work
+    depends_on:
+      app: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'artisan schedule:work' >/dev/null"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  mysql:
+    image: mysql:8.4
+    container_name: bank-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root_secret}
+      MYSQL_DATABASE: ${DB_DATABASE:-bank_db}
+      MYSQL_USER: ${DB_USERNAME:-bank}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-bank_secret}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  redis:
+    image: redis:7-alpine
+    container_name: bank-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: bank-mailpit
+    restart: unless-stopped
+    ports:
+      - "1025:1025" # SMTP
+      - "8025:8025" # UI
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8025/livez"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # One-shot production asset build (public/build). nginx waits for it.
+  assets:
+    image: node:22-alpine
+    container_name: bank-assets
+    working_dir: /var/www/html
+    volumes:
+      - .:/var/www/html
+      - node_modules:/var/www/html/node_modules
+    command: sh -c "npm ci --no-audit --no-fund && npm run build"
+    restart: "no"
+
+  # Optional HMR dev server: docker compose --profile dev up -d vite
+  vite:
+    profiles: ["dev"]
+    image: node:22-alpine
+    container_name: bank-vite
+    working_dir: /var/www/html
+    volumes:
+      - .:/var/www/html
+      - node_modules:/var/www/html/node_modules
+    command: sh -c "npm ci --no-audit --no-fund && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "5173:5173"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5173/"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+      start_period: 60s
+
+  # Python AI service (FastAPI), opt-in: docker compose --profile ai up -d --build
+  # Build context defaults to ../ai_model; override with AI_SERVICE_BUILD_CONTEXT in .env.
+  # Then set AI_DRIVER=http and AI_SERVICE_URL=http://ai-service:8001 (see .env.docker.example).
+  # No depends_on from app/queue on purpose: Laravel falls back to rules only while the service is down or absent.
+  # Contract: plan/AI_SERVICE_CONTRACT.md
+  ai-service:
+    profiles: ["ai"]
+    build:
+      context: ${AI_SERVICE_BUILD_CONTEXT:-../ai_model}
+    container_name: bank-ai-service
+    restart: unless-stopped
+    environment:
+      AI_SERVICE_TOKEN: ${AI_SERVICE_TOKEN:-}
+      ADMIN_RELOAD_TOKEN: ${AI_ADMIN_TOKEN:-}
+      ML_INGEST_TOKEN: ${ML_INGEST_TOKEN:-}
+      LARAVEL_URL: http://nginx
+      MODEL_DIR: /models
+    ports:
+      - "8001:8001"
+    volumes:
+      - ai-models:/models
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/health').status==200 else 1)\""]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+volumes:
+  mysql-data:
+  redis-data:
+  vendor:
+  node_modules:
+  ai-models:

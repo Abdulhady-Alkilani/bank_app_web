@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Lint, build & test (PHP 8.4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, intl, gd, zip, bcmath, pdo_sqlite, sqlite3
+          coverage: pcov
+          tools: composer:v2
+
+      - name: Get composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: composer-${{ hashFiles('composer.lock') }}
+          restore-keys: composer-
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Build frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Prepare environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Code style (Pint)
+        run: vendor/bin/pint --test
+
+      - name: Tests with coverage
+        run: php artisan test --coverage --min=70
+
+  mysql-smoke:
+    name: MySQL migrate & seed smoke test
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: bank_db
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      DB_CONNECTION: mysql
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3306
+      DB_DATABASE: bank_db
+      DB_USERNAME: root
+      DB_PASSWORD: root
+      SESSION_DRIVER: array
+      CACHE_STORE: array
+      QUEUE_CONNECTION: sync
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, intl, gd, zip, bcmath, pdo_mysql
+          tools: composer:v2
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Prepare environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Migrate fresh and seed
+        run: php artisan migrate:fresh --seed --force
+
+  # Optional integration job. Harmless unless the repository variable AI_SERVICE_REPO (e.g. "org/fraud-ai-service")
+  # is set (Settings > Secrets and variables > Actions > Variables). If that repo is private, also set the
+  # AI_SERVICE_REPO_TOKEN secret. It builds the Python service image, starts it with throw-away tokens, waits for /health and runs the
+  # Laravel AI tests (these use Http::fake; the container check is that it builds and answers /health).
+  ai-integration:
+    name: AI service integration (optional)
+    if: ${{ vars.AI_SERVICE_REPO != '' }}
+    runs-on: ubuntu-latest
+    env:
+      AI_SERVICE_TOKEN: ci-service-token
+      AI_ADMIN_TOKEN: ci-admin-token
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.AI_SERVICE_REPO }}
+          token: ${{ secrets.AI_SERVICE_REPO_TOKEN || github.token }}
+          path: ai-service-src
+
+      - name: Build and start the AI service
+        run: |
+          docker build -t fraud-ai-service ai-service-src
+          docker run -d --name ai-service -p 8001:8001 \
+            -e AI_SERVICE_TOKEN="$AI_SERVICE_TOKEN" -e ADMIN_RELOAD_TOKEN="$AI_ADMIN_TOKEN" fraud-ai-service
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8001/health && exit 0; sleep 2; done
+          docker logs ai-service; exit 1
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, intl, gd, zip, bcmath, pdo_sqlite, sqlite3
+          tools: composer:v2
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Prepare environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+
+      - name: Laravel AI tests
+        run: php artisan test tests/Feature/Ai tests/Feature/Scoring
